@@ -31,276 +31,326 @@
 #include	<unistd.h>
 #include	<string.h>
 
-#define	NUMSCR 10		/* limit to number of saucers	*/
-#define NUMBLS 10               /* limit to number of bullets   */
-#define NUMALL NUMSCR+NUMBLS+1	/* number of maximum threads 	*/
-#define	TUNIT  20000       	/* timeunits in microseconds    */
+#define MAXBLS  20		/* Number of bullet threads at once */
+#define MAXSCR  10		/* Number of saucer threads at once */
+#define	NUMALL	MAXBLS+MAXSCR+1	/* Number of threads running */
+#define	TUNIT   20000		/* timeunits in microseconds */
+#define NUMLOSE	10		/* Number of escaped units until loss */
+#define ROWSCRS 10		/* Number of rows saucers can occupy from top */
 
-/* Struct to hold saucer data */
-struct	spropset {
-	char	*str;	/* the saucer 	*/
-	int	delay;  /* delay in time units */
-	int	row;	/* the row	*/
-	int     col;    /* the column */
-	int	dir;	/* the direction 1 or -1 */
-	int	alive;  /* 1 for alive, 0 for dead */
+struct	element {
+	char	*str;
+	int	type;	/* 0 for player, 1 for saucer, 2 for bullet */
+	int	alive;  /* bullets and saucers, is alive? 1 or 0 */
+	int	respawn;/* if dead, how many cycles to stay dead for? */
+	int	row;	/* row */
+	int	col;	/* column */
+	int	delay;	/* delay in units of TUNIT */
 };
 
-/* Struct to hold bullet data */
-struct bpropset {
-	char    *str;   /* the bullet */
-	int	delay;  /* delay in time units */
-	int	row;	/* the row    */
-	int     col;    /* the column */
-	int	fired;	/* 1 if fired, 0 if not */
-};
+int firebullet();
+int moveplayer(int);
+int setup(struct element *);
+void *animate(void *);
+int detectcollision();
+int collisionbls(int);
+int collisionscr(int);
+int resetscr(void*);
+int rowscrinit(void*);
+int resetbls(void*);
+int eledraw(void*);
+int scrtxtdraw();
+int eleclear(void*, int);
 
-/* Struct to hold cursor (player) data */
-struct cpropset {
-	char *str;   /* the player cursor */
-	int  col;    /* the column */
-};
-
-pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
+struct element	elements[NUMALL];
+int score;
+int escape;
+pthread_mutex_t collisionlock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t scorelock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t escapelock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t firelock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t movelock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t drawlock = PTHREAD_MUTEX_INITIALIZER;
 
 int main(int ac, char *av[])
 {
-	int	        c;		   /* user input		*/
-	pthread_t       thrds[NUMALL];     /* max amt threads		*/
-	struct spropset scrprops[NUMSCR];  /* properties of saucer	*/
-	struct bpropset blsprops[NUMBLS];  /* properties of bullets	*/
-	struct cpropset plrprops[1];	   /* properties of player	*/
-	void	        *scranimate();	   /* the saucer function	*/
-	void	        *blsanimate();	   /* the bullet function	*/
-	void	        *plranimate();	   /* the player function	*/
-	int	        i;
+	pthread_t	thrds[NUMALL];		/* the threads		*/
+	void		*animate();		/* the function		*/
+	int		num_msg ;		/* number of strings	*/
+	int		c;			/* user input		*/
+	int		i;
 
-	setup_player(plrprops);
-	setup_bullets(blsprops);
-	setup_saucers(scrprops);
-	
+	setup(elements);
+
 	/* create all the threads */
-	for(i=0 ; i<(NUMALL); i++)
-	{
-		if (i < 1) {
-			if(pthread_create(&thrds[i], NULL, plranimate, 
-					  &plrprops[i])){
-				fprintf(stderr, "error creating thread");
-				endwin();
-				exit(0);
-			}
-		} else if (i < 1 + NUMSCR) {
-			if(pthread_create(&thrds[i], NULL, scranimate, 
-					  &scrprops[i-1])){
-				fprintf(stderr, "error creating thread");
-				endwin();
-				exit(0);
-			}
-		} else if (i < NUMALL) {
-			if(pthread_create(&thrds[i], NULL, blsanimate,
-					  &blsprops[i-1-NUMSCR])){
-				fprintf(stderr, "error creating thread");
-				endwin();
-				exit(0);
-			}
+	for(i=0 ; i<NUMALL; i++)
+		if ( pthread_create(&thrds[i], NULL, animate, &elements[i])){
+			fprintf(stderr,"error creating thread");
+			endwin();
+			exit(0);
 		}
-	}
-
-	/* process user input and game logic */
+	moveplayer('.');
+	/* process user input */
 	while(1) {
-		collisiondetect(blsprops, scrprops);
 		c = getch();
-		if ( c == 'Q' ) 
-			break;
-		// move left
-		if ( c == ',' && plrprops[0].col > 0)
-			plrprops[0].col = plrprops[0].col-1;
-		// move right
-		else if ( c == '.' && plrprops[0].col+3 < COLS)
-			plrprops[0].col = plrprops[0].col+1;
-		// fire bullet
-		if ( c == ' ' )
-			firebullet(blsprops, plrprops[0].col);
+		if (c == 'Q' || escape >= NUMLOSE) break;
+		if (c == ' ')
+			firebullet();
+		if (c == ',' || c == '.')
+			moveplayer(c);
 	}
-
+	
 	/* cancel all the threads */
-	pthread_mutex_lock(&mx);
+	pthread_mutex_lock(&drawlock);
 	for (i=0; i<NUMALL; i++ )
 		pthread_cancel(thrds[i]);
 	endwin();
+	printf("Your final score was: %d\n", score);
 	return 0;
 }
 
-/* Attempt to fire a bullet */
-int firebullet(struct bpropset props[], int colval)
-{
+/* Fires a bullet from the player location */
+int firebullet() {
 	int i;
-	pthread_mutex_lock(&mx);	
-	for(i=0; i<NUMBLS; i++){
-		if(props[i].fired == 0) {
-			props[i].fired = 1;
-			props[i].col = colval;
+	pthread_mutex_lock(&firelock);
+	for (i=0; i<NUMALL; i++) {
+		if (elements[i].type == 2 && 
+		    elements[i].alive == 0) {
+			elements[i].row = LINES-3;
+			elements[i].col = elements[0].col;
+			elements[i].alive = 1;
 			break;
-		}
+		}	
 	}
-	pthread_mutex_unlock(&mx);
+	pthread_mutex_unlock(&firelock);
 	return 0;
 }
 
-/* Handle collisions between saucers and bullets */
-int collisiondetect(struct bpropset bprops[], struct spropset sprops[])
-{
-	int i;
-	int j;
-	pthread_mutex_lock(&mx);
-	for(i=0; i<NUMBLS; i++) {
-		if (bprops[i].fired == 0)
-			continue;
-		for(j=0; j<NUMSCR; j++) {
-			if (bprops[i].row >= sprops[j].row-1 &&
-			    bprops[i].row <= sprops[j].row+1 &&
-			    bprops[i].col >= sprops[j].col &&
-			    bprops[i].col <= sprops[j].col+5) {
-				bprops[i].fired=0;
-				sprops[j].alive=0;
-			}
-		}
-	}
-	pthread_mutex_unlock(&mx);
+/* Moves the player according to input */
+int moveplayer(int c) {
+	pthread_mutex_lock(&movelock);
+	elements[0].row = LINES-2;
+	if (c == ',' && elements[0].col > 0)
+		elements[0].col--;
+	if (c == '.'&& elements[0].col+3 < COLS) 
+		elements[0].col++;
+	pthread_mutex_unlock(&movelock);
 	return 0;
 }
 
-/* Initialize the values for each saucer */
-int setup_saucers(struct spropset props[])
+/* Setup all elements and undeclared globals */
+int setup(struct element elmts[])
 {
 	int i;
-	/* assign rows and velocities to each string */
 	srand(getpid());
-	for(i=0; i<NUMSCR; i++){
-		props[i].str = "<--->";      		/* the message	*/
-		props[i].row = i+1;		        /* the row	*/
-		props[i].delay = 1+(rand()%15);	        /* a speed	*/
-		props[i].dir = ((rand()%2)?1:-1);	/* +1 or -1	*/
-		props[i].col = rand()%(COLS-8);
-		props[i].alive = 1;
+
+	score = 0;
+	escape = 0;
+
+	/* Setup array of elements */
+	for(i=0 ; i<NUMALL; i++){
+		// setup the player
+		if (i == 0) {
+			elmts[i].str = "|";
+			elmts[i].type = 0;
+			elmts[i].alive = 1;
+			elmts[i].respawn = 1;
+			elmts[i].row = LINES-2;
+			elmts[i].col = 1;
+			elmts[i].delay = 1;
+		}
+		// setup the saucers
+		else if (i < MAXSCR+1) {
+			elmts[i].str = "<--->";
+			elmts[i].type = 1;
+			elmts[i].alive = 0;
+			elmts[i].respawn = 1+(rand()%100);
+			elmts[i].row = 1+(rand()%ROWSCRS);
+			elmts[i].col = 0;
+			elmts[i].delay = 1+(rand()%20);
+		} 
+		// setup the bullets
+		else {
+			elmts[i].str = "^";
+			elmts[i].type = 2;
+			elmts[i].alive = 0;
+			elmts[i].respawn = 0;
+			elmts[i].row = 0;
+			elmts[i].col = 0;
+			elmts[i].delay = 5;
+		}
 	}
-
-	return 0;
-}
-
-/* Initialize the bullets in the propset's string value */
-int setup_bullets(struct bpropset props[])
-{
-	int i;
-	for(i=0; i<NUMBLS; i++){
-		props[i].str = "^";
-		props[i].row = LINES-3;
-		props[i].col = 0;
-		props[i].delay = 5;
-		props[i].fired = 0;
-	}
-	return 0;
-}
-
-/* Initialize the player cursor */
-int setup_player(struct cpropset props[])
-{
-	props[0].str = "|";
-	props[0].col = COLS/2;
 
 	/* set up curses */
 	initscr();
 	crmode();
 	noecho();
 	clear();
-	mvprintw(LINES-1,0,"'Q' to quit ',' moves left '.' moves "  
-		 "right SPACE fires");
 	return 0;
 }
 
-
-/* the code that runs in each saucer thread */
-void *scranimate(void *arg)
+/* the code that runs in each thread */
+void *animate(void *arg)
 {
-	struct 	spropset *info = arg;
-	int	len = strlen(info->str)+2;
-
+	struct element *info = arg;		/* point to info block	*/
+	int	len = strlen(info->str)+2;	/* +2 for padding	*/
+	int	i;
 	while( 1 )
 	{
+		detectcollision();
 		usleep(info->delay*TUNIT);
-		pthread_mutex_lock(&mx);
+		// Handle alive code
 		if (info->alive) {
-			move(info->row, info->col);
-			addch(' ');
-			addstr( info->str );
-			addch(' ');
-		} else {
-			move(info->row, info->col);
-			addstr("       ");
-			info->row = LINES;
-			info->col = COLS;
+			// Handle player specific code, always alive
+			if (info->type == 0) {
+				scrtxtdraw();
+				pthread_mutex_lock(&movelock);
+				eledraw(arg);
+				pthread_mutex_unlock(&movelock);
+			}
+			// Handle saucer code
+			else if (info->type == 1) {
+				eledraw(arg);
+				info->col++;
+				// end of screen, escape and die
+				if (info->col+len >= COLS) {
+					pthread_mutex_lock(&escapelock);
+					escape++;
+					pthread_mutex_unlock(&escapelock);
+					eleclear(arg, len);
+					resetscr(arg);
+				}
+			}
+			// Handle bullet code
+			else {
+				eleclear(arg,len);
+				pthread_mutex_lock(&firelock);
+				info->row--;
+				eledraw(arg);
+				// top of screen, escape and die
+				if (info->row <=0) {
+					eleclear(arg,len);
+					resetbls(arg);
+				}
+				pthread_mutex_unlock(&firelock);
+			}
 		}
-
-		/* move item to next column and check for bouncing */
-		info->col += info->dir;
-		if ( info->col <= 0 && info->dir == -1 )
-			info->dir = 1;
-		else if (  info->col+len >= COLS && info->dir == 1 )
-			info->dir = -1;
-
-		move(LINES-1,COLS-1);
-		refresh();
-		pthread_mutex_unlock(&mx);
+		// Handle not alive code, player is never here
+		else {
+			// Handle saucer code
+			if (info->type == 1) {
+				eleclear(arg,len);
+				info->respawn--;
+				if (!info->respawn) {
+					info->alive=1;
+					rowscrinit(arg);
+				}
+			}
+			// Handle bullet code
+			else if (info->type == 2) {
+				eleclear(arg, len);
+			}
+		}
 	}
 }
 
-/* the code that runs in each bullet thread */
-void *blsanimate(void *arg)
-{
-	struct 	bpropset *info = arg;
-
-	while( 1 )
-	{
-		usleep(info->delay*TUNIT);
-		pthread_mutex_lock(&mx);
-		if(info->fired) {
-			info->row -= 1;
-			move(info->row+1, info->col);
-			addstr("   ");
-			move(info->row, info->col);
-			addch(' ');
-			addstr(info->str);
-			addch(' ');
-			if (info->row == 0) {
-				move(info->row, info->col);
-				addstr("   ");
-				info->fired = 0;
-				info->row = LINES-3;
-			}	
-		} else {
-			move(info->row, info->col);
-			addstr("   ");
-			info->row = LINES-3;
-		}
-		move(LINES-1, COLS-1);
-		refresh();
-		pthread_mutex_unlock(&mx);
+/* Handles checking if a bullet touched a saucer */
+int detectcollision() {
+	int saucer, bullet;
+	pthread_mutex_lock(&collisionlock);
+	for (saucer=1; saucer<MAXSCR+1; saucer++) {
+		for (bullet=1+MAXSCR; bullet<NUMALL; bullet++) {
+			if ((elements[saucer].alive == 1) &&
+			    (elements[bullet].alive == 1) &&
+			    (elements[saucer].row == elements[bullet].row) &&
+			    (elements[bullet].col >= elements[saucer].col-1) &&
+			    (elements[bullet].col <= 
+			     (elements[saucer].col + 
+			      strlen(elements[saucer].str)-1))) {
+				collisionbls(bullet);
+				collisionscr(saucer);
+				pthread_mutex_lock(&scorelock);
+				score++;
+				pthread_mutex_unlock(&scorelock);
+				pthread_mutex_unlock(&collisionlock);
+				return 0;
+			}
+		}		
 	}
+	pthread_mutex_unlock(&collisionlock);
+	return 0;
 }
 
-/* the code that runs for the player cursor */
-void *plranimate(void *arg)
-{
-	struct cpropset *info = arg;
-	while( 1 )
-	{
-		pthread_mutex_lock(&mx);
-		move(LINES-2, info->col);
-		addch(' ');
-		addstr( info->str );
-		addch(' ');
-		move(LINES-1, COLS-1);
-		refresh();
-		pthread_mutex_unlock(&mx);
+/* collision bullet handler */
+int collisionbls(int index) {
+	eleclear(&elements[index], strlen(elements[index].str)+2);
+	resetbls(&elements[index]);
+}
+
+/* collision saucer handler */
+int collisionscr(int index) {
+	eleclear(&elements[index], strlen(elements[index].str)+2);
+	resetscr(&elements[index]);
+}
+
+/* saucer reset */
+int resetscr(void *arg) {
+	struct element *info = arg;
+	info->alive=0;
+	info->respawn=1+(rand()%100);
+	info->col=0;
+	info->row=0;
+	info->delay=1+(rand()%20);
+}
+
+/* saucer row re-init */
+int rowscrinit(void *arg) {
+	struct element *info = arg;
+	info->row=1+(rand()%ROWSCRS);
+}
+
+/* bullet reset */
+int resetbls(void *arg) {
+	struct element *info = arg;
+	info->alive = 0;
+	info->col=0;
+	info->row=0;
+}
+
+/* draws the element */
+int eledraw(void *arg) {
+	struct element *info = arg;
+	pthread_mutex_lock(&drawlock);
+	move( info->row, info->col );
+	addch(' ');
+	addstr( info->str );
+	addch(' ');
+	move(LINES-1,COLS-1);
+	refresh();
+	pthread_mutex_unlock(&drawlock);
+}
+
+/* score text draw */
+int scrtxtdraw() {
+	pthread_mutex_lock(&drawlock);
+	mvprintw(LINES-1,0,"'Q' to quit ',' moves left "
+		 "'.' moves right SPACE fires, "
+		 "Missed: %d/%d, Score: %d",escape,NUMLOSE,score);
+	if (escape >= NUMLOSE) {
+		mvprintw(LINES-2,0,"Game over! Anykey to exit");
 	}
+	pthread_mutex_unlock(&drawlock);
+}
+
+/* clears the element */
+int eleclear(void *arg, int len) {
+	struct element *info = arg;
+	int i;
+	pthread_mutex_lock(&drawlock);
+	move(info->row, info->col);
+	for (i=0; i<len; i++)
+		addch(' ');
+	move(LINES-1, COLS-1);
+	refresh();
+	pthread_mutex_unlock(&drawlock);				
 }
